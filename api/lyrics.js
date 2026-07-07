@@ -231,13 +231,29 @@ export default async function handler(req, res) {
   try {
     // MODO 1: música específica -> letra + annotations + blocos p/ Notion
     if (song) {
-      const results = await geniusSearch(`${artist || ''} ${song}`.trim());
-      const hit =
-        (artist &&
-          results.find(
-            (r) => r.primary_artist?.name?.toLowerCase() === artist.toLowerCase()
-          )) ||
-        results[0];
+      // Preferência: achar a música na lista do próprio artista (mais
+      // confiável que a busca textual, que às vezes traz outro artista).
+      let hit = null;
+      if (artist) {
+        const artistId = await getArtistId(artist);
+        if (artistId) {
+          const songs = await getArtistSongs(artistId, 200);
+          const q = song.toLowerCase();
+          hit =
+            songs.find((s) => s.title?.toLowerCase() === q) ||
+            songs.find((s) => s.title?.toLowerCase().includes(q));
+        }
+      }
+      // Fallback: busca textual, priorizando o hit cujo artista corresponde.
+      if (!hit) {
+        const results = await geniusSearch(`${artist || ''} ${song}`.trim());
+        hit =
+          (artist &&
+            results.find(
+              (r) => r.primary_artist?.name?.toLowerCase() === artist.toLowerCase()
+            )) ||
+          results[0];
+      }
       if (!hit) return res.status(404).json({ error: 'song not found' });
 
       const lyrics = await scrapeLyrics(hit.url);

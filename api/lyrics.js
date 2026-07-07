@@ -1,135 +1,91 @@
 import * as cheerio from 'cheerio';
 
-// Token gerado em https://genius.com/api-clients (Client Access Token)
-const GENIUS_TOKEN = process.env.GENIUS_ACCESS_TOKEN;
-// Segredo compartilhado só entre esta função e o seu cenário do Make
+// Fonte de letras: Letras.mus.br (sem token de API).
+// Segredo compartilhado só entre esta função e o seu cenário do Make.
 const MY_SECRET = process.env.MY_SECRET;
 
+const BASE = 'https://www.letras.mus.br';
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 const NOTION_LIMIT = 1900; // margem sob o limite de 2000 chars por bloco do Notion
 
-// --- Busca genérica na API do Genius ---
-async function geniusSearch(query) {
-  const res = await fetch(
-    `https://api.genius.com/search?q=${encodeURIComponent(query)}`,
-    { headers: { Authorization: `Bearer ${GENIUS_TOKEN}` } }
-  );
-  const data = await res.json();
-  return data?.response?.hits?.map((h) => h.result) ?? [];
+// --- Converte o nome do artista no slug de URL do Letras.mus.br ---
+// "Samuel Batista Filho" -> "samuel-batista-filho"
+function slugify(name) {
+  return name
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove acentos
+    .replace(/[^a-z0-9\s-]/g, '') // remove caracteres especiais
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-');
 }
 
-// --- Descobre o ID do artista a partir do nome ---
-async function getArtistId(artistName) {
-  const results = await geniusSearch(artistName);
-  const exact = results.find(
-    (r) => r.primary_artist?.name?.toLowerCase() === artistName.toLowerCase()
-  );
-  const hit = exact || results[0];
-  return hit ? hit.primary_artist.id : null;
+// --- Baixa o HTML de uma página (com User-Agent de navegador) ---
+async function getPage(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9' },
+  });
+  if (!res.ok) return null;
+  return await res.text();
 }
 
-// --- Lista as músicas do artista (ordenadas por popularidade) ---
-async function getArtistSongs(artistId, max = 20) {
+// --- Lista as músicas do artista a partir da página dele ---
+// Seletor confirmado ao vivo: a.songList-table-songName
+async function getArtistSongs(artistName) {
+  const slug = slugify(artistName);
+  const html = await getPage(`${BASE}/${slug}/`);
   const songs = [];
-  let page = 1;
-  while (songs.length < max) {
-    const res = await fetch(
-      `https://api.genius.com/artists/${artistId}/songs?per_page=50&page=${page}&sort=popularity`,
-      { headers: { Authorization: `Bearer ${GENIUS_TOKEN}` } }
-    );
-    const data = await res.json();
-    const batch = data?.response?.songs ?? [];
-    if (!batch.length) break;
-    // Só músicas em que o artista é o principal (evita "feats" de outros)
-    songs.push(...batch.filter((s) => s.primary_artist?.id === artistId));
-    if (!data.response.next_page) break;
-    page = data.response.next_page;
-  }
-  return songs.slice(0, max);
+  if (!html) return { slug, songs };
+  const $ = cheerio.load(html);
+  const seen = new Set();
+  $('a.songList-table-songName').each((_, el) => {
+    const title = $(el).text().trim();
+    let href = $(el).attr('href') || '';
+    if (!href || !title) return;
+    if (href.startsWith('/')) href = BASE + href;
+    if (!seen.has(href)) {
+      seen.add(href);
+      songs.push({ title, url: href });
+    }
+  });
+  return { slug, songs };
 }
 
-// --- Extrai a letra da página do Genius ---
-// Resiliente: qualquer falha de rede/parse devolve '' em vez de estourar,
-// pra nunca quebrar o payload do Notion (critério de robustez do handoff).
+// --- Extrai a letra de uma página de música do Letras.mus.br ---
+// Container confirmado: .lyric-original ; cada estrofe num <p>, quebras em <br>.
+// Resiliente: qualquer falha devolve '' (nunca quebra o payload do Notion).
 async function scrapeLyrics(url) {
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) return '';
-    const html = await res.text();
+    const html = await getPage(url);
+    if (!html) return '';
     const $ = cheerio.load(html);
-    let lyrics = '';
-    $('[data-lyrics-container="true"]').each((_, el) => {
-      $(el).find('br').replaceWith('\n'); // preserva quebras de linha
-      lyrics += $(el).text() + '\n';
+    // tenta os seletores mais prováveis, em ordem
+    const cont =
+      ($('.lyric-original').first().length && $('.lyric-original').first()) ||
+      ($('.cnt-letra').first().length && $('.cnt-letra').first()) ||
+      $('[class*="lyric"]').first();
+    if (!cont || !cont.length) return '';
+    const stanzas = [];
+    cont.find('p').each((_, p) => {
+      $(p).find('br').replaceWith('\n');
+      const t = $(p).text().trim();
+      if (t) stanzas.push(t);
     });
-    return lyrics.trim();
+    if (stanzas.length) return stanzas.join('\n\n');
+    // fallback: sem <p>, usa o texto do container inteiro
+    cont.find('br').replaceWith('\n');
+    return cont.text().trim();
   } catch {
     return '';
   }
 }
 
-// --- Normaliza a data de lançamento para ISO YYYY-MM-DD ---
-// O Genius devolve `release_date_components` {year, month, day} e um texto
-// humano em `release_date_for_display`. A property Date do Notion exige ISO.
-// Se não der pra derivar um ano, devolve null (a property é omitida no POST).
-function normalizeReleaseDate(hit) {
-  const c = hit?.release_date_components;
-  if (c && c.year) {
-    const y = String(c.year).padStart(4, '0');
-    const m = String(c.month || 1).padStart(2, '0');
-    const d = String(c.day || 1).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-  }
-  const disp = hit?.release_date_for_display;
-  if (disp) {
-    const t = Date.parse(disp); // fallback: "January 1, 2020"
-    if (!Number.isNaN(t)) return new Date(t).toISOString().slice(0, 10);
-  }
-  return null;
-}
-
-// --- Busca as annotations (explicações verso a verso) via API ---
-// A API do Genius devolve os "referents": cada um tem um trecho da letra
-// (fragment) e uma ou mais explicações (annotations[].body.plain).
-async function getAnnotations(songId, max = 50) {
-  const out = [];
-  let page = 1;
-  while (out.length < max) {
-    const res = await fetch(
-      `https://api.genius.com/referents?song_id=${songId}` +
-        `&text_format=plain&per_page=50&page=${page}`,
-      { headers: { Authorization: `Bearer ${GENIUS_TOKEN}` } }
-    );
-    if (!res.ok) break;
-    const data = await res.json();
-    const referents = data?.response?.referents ?? [];
-    if (!referents.length) break;
-
-    for (const ref of referents) {
-      const fragment = (ref.fragment || '').trim();
-      // Pega a explicação mais votada de cada trecho
-      const best = (ref.annotations || [])
-        .slice()
-        .sort((a, b) => (b.votes_total ?? 0) - (a.votes_total ?? 0))[0];
-      const explanation = best?.body?.plain?.trim();
-      if (fragment && explanation) {
-        out.push({
-          fragment,
-          annotation: explanation,
-          votes: best.votes_total ?? 0,
-          url: ref.url || null,
-        });
-      }
-    }
-
-    if (!data.response.next_page) break;
-    page = data.response.next_page;
-  }
-  return out.slice(0, max);
-}
-
 // =====================================================================
-//  Helpers do Notion — deixam o Make trivial: a função já devolve os
-//  blocos prontos e (opcional) o corpo completo do POST /v1/pages.
+//  Helpers do Notion — a função já devolve os blocos prontos e (opcional)
+//  o corpo completo do POST /v1/pages.
 // =====================================================================
 
 // Quebra um texto grande em pedaços <= NOTION_LIMIT, sem cortar palavra.
@@ -175,7 +131,7 @@ function toStanzas(lyrics) {
     .filter(Boolean);
 }
 
-// Monta o array de blocks do Notion: estrofes + seção de annotations.
+// Monta o array de blocks do Notion: estrofes + (opcional) seção de annotations.
 function buildNotionChildren(lyrics, annotations) {
   const children = [];
   for (const stanza of toStanzas(lyrics)) {
@@ -184,9 +140,7 @@ function buildNotionChildren(lyrics, annotations) {
   if (annotations.length) {
     children.push(heading('Annotations'));
     for (const a of annotations) {
-      // trecho da letra em negrito
       for (const piece of chunk(a.fragment)) children.push(paragraph(piece, true));
-      // explicação
       for (const piece of chunk(a.annotation)) children.push(paragraph(piece));
     }
   }
@@ -194,20 +148,15 @@ function buildNotionChildren(lyrics, annotations) {
 }
 
 // Corpo completo do POST https://api.notion.com/v1/pages (se ?db= for passado).
-// Schema real da base: Título (Title), Artista (Select), URL (URL),
-// Lançamento (Date). Ajuste os NOMES aqui se renomear colunas na sua base.
+// Schema da base: Título (Title), Artista (Select), URL (URL), Lançamento (Date).
 function buildNotionPayload(dbId, meta, children) {
   const properties = {
     'Título': { title: [{ text: { content: meta.title || 'Sem título' } }] },
-    // Select: o Notion cria a opção sozinho se ela ainda não existir.
-    // Nome de opção não pode conter vírgula — troca por espaço por segurança.
     'Artista': {
       select: { name: (meta.artist || 'Desconhecido').replace(/,/g, ' ').trim() },
     },
     'URL': { url: meta.url || null },
   };
-  // Date só entra se tivermos um ISO válido; senão a property é omitida
-  // (mandar valor inválido faria o POST voltar 400).
   if (meta.release_iso) {
     properties['Lançamento'] = { date: { start: meta.release_iso } };
   }
@@ -215,7 +164,7 @@ function buildNotionPayload(dbId, meta, children) {
 }
 
 // Exportados só para testes unitários (não afetam o handler da Vercel).
-export { toStanzas, buildNotionChildren, buildNotionPayload, chunk, normalizeReleaseDate };
+export { slugify, toStanzas, buildNotionChildren, buildNotionPayload, chunk };
 
 export default async function handler(req, res) {
   // Autenticação simples: só o seu Make consegue chamar
@@ -225,54 +174,36 @@ export default async function handler(req, res) {
 
   const params = req.method === 'POST' ? req.body : req.query;
   const { artist, song, max = 20, db } = params;
-  // annotations vêm ligadas por padrão; passe annotations=0 pra desligar
-  const wantAnnotations = String(params.annotations ?? '1') !== '0';
 
   try {
-    // MODO 1: música específica -> letra + annotations + blocos p/ Notion
+    // MODO 1: música específica -> letra + blocos p/ Notion
     if (song) {
-      // Preferência: achar a música na lista do próprio artista (mais
-      // confiável que a busca textual, que às vezes traz outro artista).
-      let hit = null;
-      if (artist) {
-        const artistId = await getArtistId(artist);
-        if (artistId) {
-          const songs = await getArtistSongs(artistId, 200);
-          const q = song.toLowerCase();
-          hit =
-            songs.find((s) => s.title?.toLowerCase() === q) ||
-            songs.find((s) => s.title?.toLowerCase().includes(q));
-        }
+      if (!artist) {
+        return res.status(400).json({ error: 'informe também ?artist=' });
       }
-      // Fallback: busca textual, priorizando o hit cujo artista corresponde.
-      if (!hit) {
-        const results = await geniusSearch(`${artist || ''} ${song}`.trim());
-        hit =
-          (artist &&
-            results.find(
-              (r) => r.primary_artist?.name?.toLowerCase() === artist.toLowerCase()
-            )) ||
-          results[0];
-      }
+      const { songs } = await getArtistSongs(artist);
+      const q = song.toLowerCase();
+      const hit =
+        songs.find((s) => s.title.toLowerCase() === q) ||
+        songs.find((s) => s.title.toLowerCase().includes(q));
       if (!hit) return res.status(404).json({ error: 'song not found' });
 
       const lyrics = await scrapeLyrics(hit.url);
-      const annotations = wantAnnotations
-        ? await getAnnotations(hit.id, Number(params.max_annotations ?? 50))
-        : [];
+      const annotations = []; // Letras.mus.br não tem annotations verso a verso
 
       const meta = {
         title: hit.title,
-        artist: hit.primary_artist.name,
+        artist,
         url: hit.url,
-        release_date: hit.release_date_for_display || null,
-        release_iso: normalizeReleaseDate(hit),
+        release_date: null,
+        release_iso: null,
       };
 
       const stanzas = toStanzas(lyrics);
       const notion_children = buildNotionChildren(lyrics, annotations);
-      // Se o Make passar ?db=<database_id>, já devolvemos o corpo pronto do POST.
-      const notion_payload = db ? buildNotionPayload(db, meta, notion_children) : null;
+      const notion_payload = db
+        ? buildNotionPayload(db, meta, notion_children)
+        : null;
 
       return res.status(200).json({
         ...meta,
@@ -285,18 +216,23 @@ export default async function handler(req, res) {
       });
     }
 
-    // MODO 2: só o artista -> devolve a lista de músicas (rápido, sem letra)
+    // MODO 2: só o artista -> lista de músicas (rápido, sem letra)
     if (artist) {
-      const artistId = await getArtistId(artist);
-      if (!artistId) return res.status(404).json({ error: 'artist not found' });
-      const songs = await getArtistSongs(artistId, Number(max));
+      const { slug, songs } = await getArtistSongs(artist);
+      if (!songs.length) {
+        return res
+          .status(404)
+          .json({ error: 'artist not found or no songs', slug });
+      }
+      const limited = songs.slice(0, Number(max));
       return res.status(200).json({
         artist,
-        count: songs.length,
-        songs: songs.map((s) => ({
+        slug,
+        count: limited.length,
+        songs: limited.map((s) => ({
           title: s.title,
           url: s.url,
-          release_date: s.release_date_for_display || null,
+          release_date: null,
         })),
       });
     }

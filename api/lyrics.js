@@ -204,6 +204,11 @@ export default async function handler(req, res) {
       const notion_payload = db
         ? buildNotionPayload(db, meta, notion_children)
         : null;
+      // JSON já serializado pelo Node (escapa quebras de linha corretamente).
+      // O Make mapeia esta string direto no corpo, sem re-serializar (evita 400).
+      const notion_payload_string = notion_payload
+        ? JSON.stringify(notion_payload)
+        : null;
 
       return res.status(200).json({
         ...meta,
@@ -213,6 +218,7 @@ export default async function handler(req, res) {
         annotations_count: annotations.length,
         notion_children,
         notion_payload,
+        notion_payload_string,
       });
     }
 
